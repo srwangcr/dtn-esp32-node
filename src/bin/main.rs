@@ -14,7 +14,6 @@ use dtn_core::routing::interval_tree::{CgrIntervalTree, ContactInterval};
 use dtn_core::storage::ring_buffer::LockFreeRingBuffer;
 use dtn_core::storage::wal::{scan_pages, DirectWal, PAGE_SIZE};
 use dtn_core::telemetry::metrics::SystemMetrics;
-use embedded_storage::{ReadStorage, Storage};
 use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
 use esp_hal::main;
@@ -112,6 +111,9 @@ fn main() -> ! {
 
     // Volcar la página sellada con CRC32C reutilizando `flash_page` (0 bytes extra en stack)
     if wal.write_sealed_pages(core::slice::from_mut(&mut flash_page)) > 0 {
+        if let Err(e) = flash.erase(WAL_FLASH_OFFSET, WAL_FLASH_OFFSET + PAGE_SIZE as u32) {
+            warn!("[FLASH] Error borrando sector: {:?}", e);
+        }
         match flash.write(WAL_FLASH_OFFSET, &flash_page) {
             Ok(_) => info!("[FLASH] Página WAL (4096 B + CRC32C) escrita en SPI Flash"),
             Err(e) => warn!("[FLASH] Error escribiendo sector: {:?}", e),
