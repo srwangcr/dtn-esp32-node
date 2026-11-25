@@ -150,6 +150,9 @@ fn main() -> ! {
                     RouteDecision::ForwardNextHop { node_id, .. } => {
                         let mut out = [0u8; 16];
                         let n = consumer.pop(&mut out);
+                        if let Ok(tx_frame) = framing.encode_frame(&out[..n]) {
+                            let _ = uart.write(&tx_frame);
+                        }
                         info!("[RX] Forward -> nodo {} ({} B en {} us)", node_id, n, dt_us);
                     }
                     other => info!("[RX] Decisión en {} us: {:?}", dt_us, other),
