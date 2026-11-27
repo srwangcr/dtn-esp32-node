@@ -12,19 +12,26 @@ timers de sistema.
 flowchart LR
     UART2[UART2 GPIO16/17<br/>115200 bps] --> ARQ[ReliableSerialCla<br/>Stop-and-Wait ARQ]
     ARQ --> COBS[COBS 0x00<br/>SerialFraming]
-    COBS --> BIB{BPSec BIB-HMAC-SHA2<br/>RFC 9172 ASB / RFC 9173 §3.7}
+    COBS --> BIB{BPSec BIB-HMAC-SHA2<br/>RFC 9172 ASB / RFC 9173 §3.7<br/>Scope Flags = 1}
     BIB -->|invalido| DROP[Descartado<br/>antes de encolar]
     BIB -->|valido| P[IngestionPipeline<br/>RFC 9171]
     P --> PLAN[Contact Plan Scheduler<br/>Interval Selector]
-    PLAN --> Q[OutboundBundleQueue 16x256 B<br/>pending -> persisted -> visible al TX]
-    Q --> WAL[DirectWal<br/>WalEnvelope 16 B + bundle + CRC32C]
+    PLAN -->|con contacto| Q[OutboundBundleQueue 16x256 B<br/>pending -> persisted -> visible al TX]
+    PLAN -->|sin contacto / cola llena| WAL[DirectWal<br/>WalEnvelope 28 B + bundle + CRC32C]
+    Q --> WAL
     WAL --> FLASH[NOR Flash anillo 16 sectores<br/>0x300000..0x30FFFF]
     FLASH --> REC[scan_wal_ring<br/>Crash-Recovery al arranque]
-    REC -->|Pending sin Delivered, conserva next_hop| Q
+    REC -->|Pending con ruta persistida| Q
+    REC -->|PendingRoute: re-evaluar plan, sin next_hop inventado| PLAN
     FLASH -->|ACK solo tras read-back verificado| ARQ
-    ARQ -->|Ack del siguiente salto| TOMB[WAL Delivered tombstone]
+    ARQ -->|Ack del siguiente salto| TOMB[Tombstone Delivered compacto<br/>28 B con bundle_uid de 128 bit]
     TOMB -->|pop() despues de sellar| Q
 ```
+
+Los fragmentos pendientes de reensamblado viven solo en RAM (`ReassemblySlot`)
+y **nunca** se escriben como bundles encaminables en el WAL. Tras agotar los
+reintentos de un enlace se aplica el backoff y se usa `reset_transport()`,
+que preserva `seq` y `expected_seq`, en lugar de un reinicio de sesión.
 
 ### 1. Wear-leveling circular en SPI Flash NOR (64 KB)
 
@@ -35,20 +42,29 @@ flowchart LR
 | Región total | `0x30_0000 .. 0x30_FFFF` (64 KiB) |
 | Siguiente slot | `(active_slot + 1) % 16` |
 
-* **Formato de registro:** cada bundle lleva un `WalEnvelope` de **16 bytes**
+* **Formato de registro:** cada bundle lleva un `WalEnvelope` de **28 bytes**
   delante de sus bytes BPv7:
-  `[state: u8 | reserved: [u8; 3] | bundle_id_crc: u32 LE | next_hop: u64 LE]`.
-  `0x01 = Pending`, `0x02 = Delivered`. El CRC32C del envelope es un identificador
-  estable del bundle (no un contexto BPSec), y `next_hop` conserva la decisión
-  original del plan de contactos.
+  `[state: u8 | reserved: [u8; 3] | bundle_uid: [u8; 16] | next_hop: u64 LE]`.
+  Los estados son `0x01 = Pending`, `0x02 = Delivered` y
+  `0x03 = PendingRoute`. `bundle_uid` son los primeros 16 bytes de SHA-256 sobre
+  la identidad canónica BPv7 (EID de origen, timestamp de creación, secuencia y
+  coordenadas de fragmento), estable aunque el bundle se recodifique. CRC32C
+  protege **únicamente la página física del WAL**: nunca es un ID de bundle ni
+  un contexto BPSec.
+* **Tombstones compactos:** `Delivered` escribe solo los 28 bytes del envelope
+  (sin bytes del bundle) con el `bundle_uid` de 128 bits. Boot compara UIDs de
+  16 bytes, no CRCs de 32 bits.
 * **Crash-Recovery:** `scan_wal_ring()` hace dos pasadas sobre los 16 sectores
   reutilizando **un único buffer de 4096 B**. La primera localiza el `max_seq`
-  y el sector activo; la segunda reproduce los registros válidos en orden de
-  secuencia (cruzando el punto de wrap) e invoca el callback de recuperación.
-  Al arranque se omiten los registros `Pending` cuyo `bundle_id_crc` ya tiene un
-  tombstone `Delivered` posterior; el resto se reinyecta con su `next_hop`
-  persistido. Sectores en blanco, escrituras parciales (*torn writes*) y
-  generaciones obsoletas se descartan por CRC32C / monotonicidad.
+  y el sector activo y recopila los UIDs entregados; la segunda reproduce los
+  registros válidos en orden de secuencia (cruzando el punto de wrap) e invoca
+  el callback de recuperación. Se omiten los bundles cuyo `bundle_uid` tiene un
+  tombstone `Delivered` posterior; los fragmentos no se reinyectan como bundles
+  encaminables. Los `Pending` conservan su `next_hop` persistido, mientras que
+  los `PendingRoute` se re-evalúan contra el plan de contactos: si no hay
+  contacto permanecen en el WAL sin cola y **sin asignar `DEFAULT_NEXT_HOP`**.
+  Sectores en blanco, escrituras parciales (*torn writes*) y generaciones
+  obsoletas se descartan por CRC32C / monotonicidad.
 * **En ejecución:** cada página WAL sellada se escribe rotando al siguiente
   sector **sin borrar los otros 15**. La secuencia del `DirectWal` se reanuda en
   `max_seq + 1` para que una página nueva nunca se confunda con una generación
@@ -72,7 +88,12 @@ Cabecera ligera de enlace dentro de cada frame COBS:
   `AwaitingAck` o `Failed`: no sobrescribe la trama pendiente.
 * `max_retries = 3`: tras agotar el presupuesto el enlace pasa a `Failed`. El
   bundle **no se hace `pop()`**: aplica un backoff no bloqueante de
-  `500_000 us`, llama a `link.reset()` y reenvía el mismo frente de cola.
+  `500_000 us` y llama a `link.reset_transport()`, que limpia la trama en vuelo,
+  los reintentos y el frame COBS parcial pero **conserva `seq` y
+  `expected_seq`**. Si el par ya hizo commit del ACK perdido y espera el
+  siguiente `seq`, reiniciar la sesión provocaría un bucle infinito de
+  `DuplicateData`/NACK; por eso el reinicio completo está reservado al arranque
+  en frío.
 * **ACK durable, no automático:** decodificar `Data` crea `PendingCommit` pero
   no envía ACK. El firmware copia el payload, ejecuta el pipeline, hace
   `wal.append()` y luego `erase -> write -> read_back -> scan_pages` valida
@@ -91,7 +112,7 @@ Cabecera ligera de enlace dentro de cada frame COBS:
 * Los datos del bloque son un **ASB de RFC 9172**:
   `[targets, context_id, flags, source, params, results]`. El único contexto
   soportado es RFC 9173 `SECURITY_CONTEXT_BIB_HMAC_SHA2 = 1` con SHA Variant
-  `5` (HMAC 256/256) y el parámetro de Scope Flags `3`. El perfil fija
+  `5` (HMAC 256/256). El perfil fija de forma inequívoca
   **`Scope Flags = 1`** (`BIB_SCOPE_PRIMARY_BLOCK = 0x01`, Primary + Payload).
   No existe el contexto CRC32C inventado por revisiones anteriores: CRC32C
   protege solo el WAL.
@@ -103,9 +124,9 @@ Cabecera ligera de enlace dentro de cada frame COBS:
 * `BibVerifier` se ejecuta dentro de `IngestionPipeline` **antes** de la cola
   de salida y del WAL: integridad inválida produce `DropIntegrityFailed` y
   nunca provoca ACK.
-* El firmware usa un verificador *opportunistic* (acepta bundles herederos sin
-  BIB pero verifica cualquier BIB presente); el modo `required` está disponible
-  y se ejercita en la suite de estrés.
+* El firmware usa **por defecto** un verificador *opportunistic* (acepta bundles
+  herederos sin BIB pero verifica cualquier BIB presente); el modo `required`
+  está disponible y se ejercita en la suite de estrés.
 
 ### 4. Reenvío de bundles completos y recuperación
 
@@ -118,26 +139,35 @@ Cabecera ligera de enlace dentro de cada frame COBS:
   `persist_ready_pages()` con read-back verificado, la hace visible al TX. Si la
   Flash falla, `discard_last_pending()` la retira: nunca se transmite un bundle
   no durable (`Validated -> Persisted -> OutboundQueue`).
+* La decisión es explícita: `ForwardNextHop` implica que el bundle **sí** entró
+  en la cola. Si la cola está llena, `StoredPendingForward` persiste el bundle
+  como `PendingRoute` sin encolarlo (se ACK pero no se transmite); sin WAL
+  disponible se devuelve `DropBackpressure` y se rechaza la trama. Con
+  `DropNoRoute` el bundle válido también se ACK y se guarda como `PendingRoute`
+  (`PersistedToWal`) para esperar un contacto futuro.
 * El bucle principal toma `front_parts()`, pasa esos bytes reales a
   `link.send(bundle, now_us)` y escribe la trama COBS resultante en UART2. El
   frente permanece en la cola durante `AwaitingAck`; el `pop()` solo ocurre
   cuando llega el `Ack` del siguiente salto **y** se ha sellado y verificado un
-  registro WAL `Delivered` con el mismo `bundle_id_crc`.
-* Al arrancar, `scan_wal_ring()` filtra los `Pending` ya entregados y reinyecta
-  el resto con el `next_hop` original del envelope (los registros herederos sin
-  envelope usan `DEFAULT_NEXT_HOP`). Así un bundle persistido antes de un corte
-  vuelve a salir por el enlace sin duplicar los que ya fueron acknowledged.
-* El reensamblado de fragmentos es **experimental**: `ReassemblySlot` gestiona
-  rangos y solapamientos, pero no realiza una reconstrucción multi-fragmento
-  end-to-end del ADU. El CGR multi-salto completo también es trabajo futuro.
+  tombstone `Delivered` con el mismo `bundle_uid` de 128 bits.
+* Al arrancar, `scan_wal_ring()` filtra los bundles ya entregados por UID y
+  reinyecta los `Pending` con el `next_hop` original del envelope. Los
+  `PendingRoute` vuelven a consultar el plan de contactos; si no hay contacto
+  siguen persistidos y fuera de la cola, sin un salto inventado. Los registros
+  herederos sin envelope se tratan como `PendingRoute` y los fragmentos se
+  omiten. Así un bundle persistido antes de un corte vuelve a salir por el
+  enlace sin duplicar los que ya fueron acknowledged.
+* `PendingReassembly` solo vive en `ReassemblySlot` (RAM): no se escribe como
+  bundle encaminable en el WAL. El reensamblado es **experimental** y no
+  reconstruye el ADU multi-fragmento end-to-end.
 * El plan de contactos actual hace selección EAT de un salto. El CGR multi-salto
   completo (grafo, rutas alternativas y contactos futuros) es trabajo futuro.
 
 ### Presupuesto de memoria
 
-No hay heap. Los arreglos grandes se declaran como locales en `main()` y por
-tanto son **buffers temporales en stack**, no `.bss`/`.data`; el estado
-estático del crate se reduce a contadores/estado HAL (sin tablas grandes).
+No hay heap: el crate no enlaza `alloc`. Los arreglos grandes se declaran como
+locales en `main()` y por tanto son **buffers temporales en stack**, no
+`.bss`/`.data`; el estado estático se reduce a contadores y estado HAL.
 
 | Buffer | Tamaño | Ubicación |
 | :--- | :--- | :--- |
@@ -145,20 +175,21 @@ estático del crate se reduce a contadores/estado HAL (sin tablas grandes).
 | WAL RAM (`DirectWal<1>`) | 4096 B | stack de `main()` |
 | `OutboundBundleQueue<16, 256>` | ~4.2 KB (16 x 256 B + headers + flags) | stack de `main()` |
 | COBS RX + RX decodificado + TX + `rx_buf` | 256 + 256 + 288 + 256 B | stack de `main()` / CLA |
-| Reensamblado, plan de contactos, adjuntos BIB | < 1 KB | stack de `main()` |
+| UIDs entregados (16 x 16 B), plan de contactos, reensamblado, adjuntos BIB | < 1 KB | stack de `main()` |
+| Heap (`alloc`) | **0 B** | no se enlaza `alloc` |
 | Arrays grandes en `.bss` / `.data` | **0 B** | no se declaran `static` de este tamaño |
-| **Pico típico de SRAM (stack + estática)** | **< 15 KB** | 520 KB disponibles |
+| **Pico típico de SRAM (stack + estática)** | **~18.5 KB** | 520 KB disponibles |
 
 ## Métricas reales en silicio (ESP32-WROOM-32 rev v3.1, 240 MHz)
 
 | Métrica | Resultado medido |
 | :--- | :--- |
-| Pipeline BPv7 + BIB-HMAC-SHA2 en SRAM | **260 – 266 us** (max 570 us) |
-| Pipeline + BIB + persistencia hasta `PersistedToWal` (IPPT §3.7) | **788 us** |
+| Pipeline BPv7 + BIB-HMAC-SHA2 en SRAM | **165 – 173 us** |
+| Pipeline + BIB + persistencia hasta `PersistedToWal` (IPPT §3.7) | **679 us** |
 | Erase + write + read-back en NOR (10 sectores) | **avg = 36.87 ms \| max = 37.35 ms** |
 | Verificación de sector recién escrito (magic + seq + CRC32C) | **10/10 OK** |
 | Fuzzing CBOR / BPv7 / BIB (50 tramas) | **50/50 rechazadas, 0 panics** |
-| Binario release | **150,368 B** (1.81% de partición) |
+| Binario release | **143,456 B** (1.71% de partición) |
 | Pull-the-Plug / soak test (mediciones históricas) | replay desde WAL confirmado; 1 h 50 min sin panic |
 
 > Las cifras de la tabla son mediciones tomadas en silicio sobre la revisión
@@ -184,7 +215,7 @@ estático del crate se reduce a contadores/estado HAL (sin tablas grandes).
 
 | Implementación | Lenguaje | Destino | Heap | BPv7 | BPSec BIB | CLA principales | Huella / latencia (*) |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **dtn-esp32-node (este proyecto)** | Rust `no_std` | ESP32-WROOM-32 (Xtensa) | **0 B** | Sí (bundle completo, cola transaccional) | Sí (RFC 9173 BIB-HMAC-SHA2, Scope Flags = 1) | UART2/COBS + ARQ con ACK durable y tombstone `Delivered` | **150,368 B** (1.81% de partición) binario, **< 15 KB SRAM** pico, 165–173 us pipeline (ver arriba) |
+| **dtn-esp32-node (este proyecto)** | Rust `no_std` | ESP32-WROOM-32 (Xtensa) | **0 B** | Sí (bundle completo, cola transaccional) | Sí (RFC 9173 BIB-HMAC-SHA2, Scope Flags = 1) | UART2/COBS + ARQ con ACK durable, `reset_transport()` y tombstone `Delivered` de 28 B | **143,456 B** (1.71% de partición) binario, **~18.5 KB SRAM** pico, 165–173 us pipeline (ver arriba) |
 | ION-DTN | C | Linux / RTOS | Sí | Sí (completo) | Sí | UDP, TCP, LTP, BP over multiple CLA | Orden de MB de RAM; latencia dependiente de SO |
 | µD3TN | C | Linux embebido / MCU | Sí (pequeño) | Sí | Sí (BIB) | UDP, TCP, serial (dtn) | Decenas de KB a cientos de KB |
 | dtn7-rs | Rust (`std`/async) | Linux / servidor | Sí | Sí | Sí (BIB/BCS) | TCP, UDP, WebSockets | Orden de MB; latencia de red dominante |
@@ -201,7 +232,7 @@ cero asignaciones, persistencia con OCR y enlace serial confiable sin RTOS.
 cargo +esp check --release --bin dtn-esp32-node
 cargo +esp check --release --bin dtn-esp32-node --features stress-test
 
-# Motor base en host (101 tests unitarios + 2 integración + 13 doctests).
+# Motor base en host (107 tests unitarios + 2 integración + 13 doctests).
 # IMPORTANTE: ejecutarlo desde dtn-core, no desde aquí: Cargo toma la toolchain
 # y el target del directorio actual, y el config de este repo apunta a
 # xtensa-esp32-none-elf (build-std=core), donde las dependencias de test de
@@ -216,10 +247,10 @@ cargo +esp clippy --release --bin dtn-esp32-node --features stress-test
 cargo +esp run --release --bin dtn-esp32-node
 ```
 
-> Estado verificado en esta revisión: los tres comandos obligatorios
-> (`cargo test` en `dtn-core` y los dos `cargo +esp check` de arriba) terminan
-> con **0 errores y 0 warnings**. Los dos `cargo +esp clippy` opcionales también
-> están limpios.
+> Estado verificado en esta revisión: los cuatro comandos obligatorios
+> (`cargo test` en `dtn-core`, los dos `cargo +esp check` y el `cargo +esp
+> clippy` sin estrés) terminan con **0 errores y 0 warnings**. El `clippy`
+> opcional con `--features stress-test` también está limpio.
 
 Para los tests 5/7 y 7/7 conecta un jumper entre GPIO17 (TX) y GPIO16 (RX); sin
 él se marcan `SKIPPED` y el resto de la suite continúa.
