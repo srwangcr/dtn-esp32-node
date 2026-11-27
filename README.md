@@ -259,6 +259,17 @@ cargo +esp run --release --bin dtn-esp32-node
 Para los tests 5/7 y 7/7 conecta un jumper entre GPIO17 (TX) y GPIO16 (RX); sin
 él se marcan `SKIPPED` y el resto de la suite continúa.
 
+## Hoja de ruta de madurez tecnológica (TRL 4 -> TRL 9)
+
+Estado actual: **TRL 4** (motor `no_std`, persistencia transaccional y enlace confiable validados en silicio real sobre ESP32-WROOM-32).
+
+- [x] **TRL 4 — Validación de componentes en laboratorio:** Parser BPv7 (RFC 9171), BPSec BIB-HMAC-SHA2 (RFC 9172/9173), anillo WAL de 16 sectores con *read-back*, Stop-and-Wait ARQ sobre COBS y pruebas en hardware (`139,312 B`, `752 us`).
+- [ ] **TRL 5 — Subsistema integrado en entorno relevante:** Topología multi-nodo física (3+ nodos por UART2 / LoRa SX1262), interoperabilidad binaria con `dtn7-rs`/`ION-DTN`, reensamblado multi-fragmento end-to-end, CGR multi-salto y confidencialidad BPSec (BCB-AES-GCM).
+- [ ] **TRL 6 — Prototipo demostrado en entorno relevante:** Portabilidad a MCU con ECC/FRAM o RISC-V tolerante a radiación (NOEL-V/LEON3), Watchdog/FDIR con particiones A/B, pruebas térmicas/vacío (TVAC) e inyección de fallos SEU en memoria.
+- [ ] **TRL 7 — Demostración de prototipo en entorno espacial:** Integración en plataforma CubeSat/PocketQube o globo estratosférico (`> 30 km`) con carga dinámica de planes de contacto desde TLE orbitales.
+- [ ] **TRL 8 — Sistema calificado para vuelo:** Cierre de calificación (ECSS-E-ST-40C / NASA-STD-8739.8), ensayos EMC/EMI con radio espacial definitiva y pruebas *End-to-End* en FlatSat/Flight Model.
+- [ ] **TRL 9 — Operación nominal en misión:** Operación continua en órbita o espacio profundo con telemetría validada y acreditación de *Flight Heritage*.
+
 ## Licencia
 
 MIT o Apache-2.0, igual que `dtn-core`.
