@@ -9,7 +9,7 @@ name = "dtn-esp32-node"
 path = "./src/bin/main.rs"
 
 [dependencies]
-dtn-core = { path = "../dtn-core", default-features = false }
+dtn-core = { path = "../dtn-core", default-features = false, features = ["bpsec"] }
 esp-hal = { version = "~1.2.2", features = ["esp32", "log-04"] }
 esp-bootloader-esp-idf = { version = "0.6.0", features = ["esp32", "log-04"] }
 esp-storage = { version = "0.10", features = ["esp32"] }
