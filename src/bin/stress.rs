@@ -5,7 +5,10 @@ use dtn_core::processor::fragmentation::ReassemblySlot;
 use dtn_core::processor::pipeline::{IngestionPipeline, RouteDecision};
 use dtn_core::routing::interval_tree::{CgrIntervalTree, ContactInterval};
 use dtn_core::storage::outbound::OutboundBundleQueue;
-use dtn_core::storage::wal::{wal_slot_offset, DirectWal, PAGE_SIZE, WAL_SECTOR_COUNT};
+use dtn_core::storage::wal::{
+    decode_wal_record, read_page, wal_slot_offset, DirectWal, PAGE_SIZE, WAL_NEXT_HOP_NONE,
+    WAL_SECTOR_COUNT,
+};
 use dtn_core::telemetry::metrics::SystemMetrics;
 use esp_hal::time::{Duration, Instant};
 use esp_hal::uart::Uart;
@@ -182,9 +185,21 @@ pub fn run_hardware_stress_suite(
             warn!("[TEST 4/7] iter={} sin pagina sellada", iteration);
             continue;
         }
+        // Ninguna prueba de estrés escribe con `append()` crudo: el pipeline
+        // siempre sella el envelope de 28 B. Verificamos magic/estado/salto
+        // antes de aceptar la página como durable.
+        let envelope_ok = read_page(page_buf)
+            .ok()
+            .and_then(|(_, payload)| decode_wal_record(payload).ok())
+            .is_some_and(|(envelope, bundle)| {
+                envelope.is_pending_route()
+                    && envelope.next_hop == WAL_NEXT_HOP_NONE
+                    && bundle == signed_bundle
+            });
         let target = *next_slot;
         let tf = Instant::now();
         let verified = persisted
+            && envelope_ok
             && super::write_and_verify_wal_sector(flash, page_buf, verify_buf, target);
         let dt_f = tf.elapsed().as_micros();
         flash_sum_us += dt_f;

@@ -44,9 +44,12 @@ que preserva `seq` y `expected_seq`, en lugar de un reinicio de sesión.
 
 * **Formato de registro:** cada bundle lleva un `WalEnvelope` de **28 bytes**
   delante de sus bytes BPv7:
-  `[state: u8 | reserved: [u8; 3] | bundle_uid: [u8; 16] | next_hop: u64 LE]`.
+  `[state: u8 | magic b"WE\x01" | bundle_uid: [u8; 16] | next_hop: u64 LE]`.
   Los estados son `0x01 = Pending`, `0x02 = Delivered` y
-  `0x03 = PendingRoute`. `bundle_uid` son los primeros 16 bytes de SHA-256 sobre
+  `0x03 = PendingRoute`. El magic/versión (`0x57 0x45 0x01`) permite distinguir
+  un envelope de 28 B de un bundle CBOR crudo: `scan_forwarding_wal_ring()`
+  descarta cualquier registro sin magic válido antes de leer `next_hop`.
+  `bundle_uid` son los primeros 16 bytes de SHA-256 sobre
   la identidad canónica BPv7 (EID de origen, timestamp de creación, secuencia y
   coordenadas de fragmento), estable aunque el bundle se recodifique. CRC32C
   protege **únicamente la página física del WAL**: nunca es un ID de bundle ni
@@ -54,8 +57,9 @@ que preserva `seq` y `expected_seq`, en lugar de un reinicio de sesión.
 * **Tombstones compactos:** `Delivered` escribe solo los 28 bytes del envelope
   (sin bytes del bundle) con el `bundle_uid` de 128 bits. Boot compara UIDs de
   16 bytes, no CRCs de 32 bits.
-* **Crash-Recovery:** `scan_wal_ring()` hace dos pasadas sobre los 16 sectores
-  reutilizando **un único buffer de 4096 B**. La primera localiza el `max_seq`
+* **Crash-Recovery:** `scan_forwarding_wal_ring()` (sobre `scan_wal_ring()`)
+  hace dos pasadas sobre los 16 sectores reutilizando **un único buffer de
+  4096 B**. La primera localiza el `max_seq`
   y el sector activo y recopila los UIDs entregados; la segunda reproduce los
   registros válidos en orden de secuencia (cruzando el punto de wrap) e invoca
   el callback de recuperación. Se omiten los bundles cuyo `bundle_uid` tiene un
@@ -232,7 +236,7 @@ cero asignaciones, persistencia con OCR y enlace serial confiable sin RTOS.
 cargo +esp check --release --bin dtn-esp32-node
 cargo +esp check --release --bin dtn-esp32-node --features stress-test
 
-# Motor base en host (107 tests unitarios + 2 integración + 13 doctests).
+# Motor base en host (109 tests unitarios + 2 integración + 13 doctests).
 # IMPORTANTE: ejecutarlo desde dtn-core, no desde aquí: Cargo toma la toolchain
 # y el target del directorio actual, y el config de este repo apunta a
 # xtensa-esp32-none-elf (build-std=core), donde las dependencias de test de

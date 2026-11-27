@@ -15,9 +15,9 @@ use dtn_core::processor::pipeline::{IngestionPipeline, RouteDecision};
 use dtn_core::routing::interval_tree::{CgrIntervalTree, ContactInterval};
 use dtn_core::storage::outbound::OutboundBundleQueue;
 use dtn_core::storage::wal::{
-    bundle_uid, decode_wal_record, read_page, scan_pages, scan_wal_ring, wal_slot_offset, DirectWal,
-    BUNDLE_UID_LEN, PAGE_SIZE, WAL_NEXT_HOP_NONE, WAL_SECTOR_COUNT, WAL_STATE_DELIVERED,
-    WAL_STATE_PENDING, WAL_STATE_PENDING_ROUTE,
+    bundle_uid, decode_wal_record, read_page, scan_forwarding_wal_ring, scan_pages, wal_slot_offset,
+    DirectWal, BUNDLE_UID_LEN, PAGE_SIZE, WAL_NEXT_HOP_NONE, WAL_SECTOR_COUNT,
+    WAL_STATE_DELIVERED, WAL_STATE_PENDING, WAL_STATE_PENDING_ROUTE,
 };
 use dtn_core::telemetry::metrics::SystemMetrics;
 use esp_backtrace as _;
@@ -45,7 +45,9 @@ const MAX_LINK_RETRIES: u8 = 3;
 /// Backoff no bloqueante antes de `link.reset_transport()` y reintento del frente.
 const LINK_BACKOFF_US: u64 = 500_000;
 
-/// Salto por defecto para registros herederos sin `next_hop` persistido.
+/// Salto del plan de contactos usado al re-evaluar `PendingRoute` en el boot.
+///
+/// Nunca se aplica a registros sin envelope: esos se descartan.
 const DEFAULT_NEXT_HOP: u32 = 42;
 
 /// Bundle BPv7 mínimo para auto-validación en arranque.
@@ -151,40 +153,40 @@ fn main() -> ! {
     let mut delivered_uids = [[0u8; BUNDLE_UID_LEN]; WAL_SECTOR_COUNT];
     let mut delivered_count = 0usize;
 
-    let _ = scan_wal_ring(
+    // Solo se visitan registros con magic y estado de envelope válidos: un
+    // bundle CBOR crudo o un registro heredero NUNCA se interpreta como ruta.
+    let tombstone_scan = scan_forwarding_wal_ring(
         |slot, page| flash.read(wal_slot_offset(slot), page).is_ok(),
-        &mut |_slot, _seq, record| {
-            if let Ok((envelope, _)) = decode_wal_record(record)
-                && envelope.is_delivered()
-                && delivered_count < WAL_SECTOR_COUNT
-            {
+        &mut |_slot, _seq, envelope, _bundle| {
+            if envelope.is_delivered() && delivered_count < WAL_SECTOR_COUNT {
                 delivered_uids[delivered_count] = envelope.bundle_uid;
                 delivered_count += 1;
             }
         },
     );
+    if tombstone_scan.records_rejected > 0 {
+        warn!(
+            "[BOOT] {} registros sin WalEnvelope valido descartados (1a pasada)",
+            tombstone_scan.records_rejected
+        );
+    }
 
     let mut recovered_count = 0usize;
     let mut reinjected_count = 0usize;
     let mut delivered_skipped = 0usize;
     let mut deferred_count = 0usize;
     let mut fragment_skipped = 0usize;
-    let recovery = scan_wal_ring(
+    let recovery = scan_forwarding_wal_ring(
         |slot, page| flash.read(wal_slot_offset(slot), page).is_ok(),
-        &mut |slot, seq, record| {
+        &mut |slot, seq, envelope, bundle| {
             recovered_count += 1;
-            let (uid, next_hop, bundle, needs_route) = match decode_wal_record(record) {
-                Ok((envelope, _)) if envelope.is_delivered() => return, // tombstone compacto
-                Ok((envelope, bundle)) => {
-                    let needs_route = envelope.is_pending_route()
-                        || envelope.next_hop == WAL_NEXT_HOP_NONE;
-                    (envelope.bundle_uid, envelope.next_hop, bundle, needs_route)
-                }
-                Err(_) => {
-                    // Registro heredero sin envelope: se trata como PendingRoute.
-                    (bundle_uid(record), WAL_NEXT_HOP_NONE, record, true)
-                }
-            };
+            if envelope.is_delivered() {
+                return; // tombstone compacto: nunca se reinyecta
+            }
+            let uid = envelope.bundle_uid;
+            let needs_route =
+                envelope.is_pending_route() || envelope.next_hop == WAL_NEXT_HOP_NONE;
+            let stored_hop = envelope.next_hop;
             if delivered_uids[..delivered_count].contains(&uid) {
                 delivered_skipped += 1;
                 return;
@@ -202,13 +204,13 @@ fn main() -> ! {
                     Some(interval) => u64::from(interval.target_node_id),
                     None => {
                         // Sin contacto: permanece persistido en el WAL, sin
-                        // cola y sin asignar un salto arbitrario (antes 42).
+                        // cola y sin asignar un salto arbitrario.
                         deferred_count += 1;
                         return;
                     }
                 }
             } else {
-                next_hop
+                stored_hop
             };
             info!(
                 "[BOOT] Bundle recuperado slot={} seq={} ({} bytes, next_hop={})",
@@ -224,11 +226,12 @@ fn main() -> ! {
         },
     );
     info!(
-        "[BOOT] Crash-Recovery anillo WAL (0x{:X}..0x{:X}): validos={} descartados={} recuperados={} reinyectados={} entregados_omitidos={} sin_ruta={} fragmentos_omitidos={} max_seq={} active_slot={} -> next_slot={}",
+        "[BOOT] Crash-Recovery anillo WAL (0x{:X}..0x{:X}): validos={} descartados={} sin_envelope={} recuperados={} reinyectados={} entregados_omitidos={} sin_ruta={} fragmentos_omitidos={} max_seq={} active_slot={} -> next_slot={}",
         wal_slot_offset(0),
         wal_slot_offset(WAL_SECTOR_COUNT - 1) + PAGE_SIZE as u32 - 1,
         recovery.pages_valid,
         recovery.pages_discarded,
+        recovery.records_rejected,
         recovered_count,
         reinjected_count,
         delivered_skipped,
