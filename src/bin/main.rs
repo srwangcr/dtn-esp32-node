@@ -22,6 +22,9 @@ use esp_hal::uart::{Config as UartConfig, Uart};
 use esp_storage::FlashStorage;
 use log::{info, warn};
 
+#[cfg(feature = "stress-test")]
+mod stress;
+
 esp_bootloader_esp_idf::esp_app_desc!();
 
 /// Offset seguro en la Flash de 4 MB (3 MB) para el WAL DTN sin pisar el firmware.
@@ -119,6 +122,9 @@ fn main() -> ! {
             Err(e) => warn!("[FLASH] Error escribiendo sector: {:?}", e),
         }
     }
+
+    #[cfg(feature = "stress-test")]
+    stress::run_hardware_stress_suite(&mut flash, &mut uart, TEST_BUNDLE);
 
     // Agregar contacto activo hacia nodo 42 para tráfico entrante por UART2
     let _ = router.insert(ContactInterval::new(0, 86_400, 42));
