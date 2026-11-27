@@ -66,7 +66,7 @@ pub fn run_hardware_stress_suite(
         sum_us += dt;
     }
     info!(
-        "[TEST 1/6 - PIPELINE 100x + BPSec] min={} us | avg={} us | max={} us | wal_accepted={}",
+        "[TEST 1/7 - PIPELINE 100x + BPSec] min={} us | avg={} us | max={} us | wal_accepted={}",
         min_us,
         sum_us / 100,
         max_us,
@@ -91,7 +91,14 @@ pub fn run_hardware_stress_suite(
             Some(&metrics),
             Some(verifier),
         ) {
-            RouteDecision::ForwardNextHop { .. } => ok_fwd += 1,
+            RouteDecision::ForwardNextHop { .. } => {
+                // Simular el punto de persistencia verificada antes de exponer
+                // la entrada al transmitter (misma regla que el firmware).
+                if outbound.has_pending() {
+                    let _ = outbound.mark_last_persisted();
+                }
+                ok_fwd += 1
+            }
             _ => backpressure += 1,
         }
     }
@@ -110,7 +117,7 @@ pub fn run_hardware_stress_suite(
         outbound.pop();
     }
     info!(
-        "[TEST 2/6 - COLA ESTATICA/BACKPRESSURE] decisiones_forward={} encolados={}/16 bundle_completo={}/16 next_hop={}/16 rechazos={} drops={}",
+        "[TEST 2/7 - COLA ESTATICA/BACKPRESSURE] decisiones_forward={} encolados={}/16 bundle_completo={}/16 next_hop={}/16 rechazos={} drops={}",
         ok_fwd,
         queued,
         queued_bytes_match,
@@ -146,7 +153,7 @@ pub fn run_hardware_stress_suite(
         }
     }
     info!(
-        "[TEST 3/6 - FUZZING CBOR/BPSec] {}/50 tramas corruptas rechazadas limpiamente",
+        "[TEST 3/7 - FUZZING CBOR/BPSec] {}/50 tramas corruptas rechazadas limpiamente",
         fuzz_errors_caught
     );
 
@@ -172,7 +179,7 @@ pub fn run_hardware_stress_suite(
         );
         let persisted = decision == RouteDecision::PersistedToWal;
         if !wal_flash.write_first_sealed_page(page_buf) {
-            warn!("[TEST 4/6] iter={} sin pagina sellada", iteration);
+            warn!("[TEST 4/7] iter={} sin pagina sellada", iteration);
             continue;
         }
         let target = *next_slot;
@@ -190,14 +197,14 @@ pub fn run_hardware_stress_suite(
             verified_ok += 1;
         } else {
             warn!(
-                "[TEST 4/6] iter={} sector=0x{:X} NO verificado; pagina retenida en WAL",
+                "[TEST 4/7] iter={} sector=0x{:X} NO verificado; pagina retenida en WAL",
                 iteration,
                 wal_slot_offset(target)
             );
         }
     }
     info!(
-        "[TEST 4/6 - ERASE+WRITE+READBACK 10x] avg={} us | max={} us | sector_verify_ok={}/10 | next_slot={}",
+        "[TEST 4/7 - ERASE+WRITE+READBACK 10x] avg={} us | max={} us | sector_verify_ok={}/10 | next_slot={}",
         flash_sum_us / 10,
         flash_max_us,
         verified_ok,
@@ -229,9 +236,9 @@ pub fn run_hardware_stress_suite(
         }
     }
     if loopback_ok {
-        info!("[TEST 5/6 - UART2 COBS LOOPBACK] PASS (GPIO17 -> GPIO16 bit-exact)");
+        info!("[TEST 5/7 - UART2 COBS LOOPBACK] PASS (GPIO17 -> GPIO16 bit-exact)");
     } else {
-        warn!("[TEST 5/6 - UART2 COBS LOOPBACK] SKIPPED (une GPIO16 y GPIO17 con un jumper)");
+        warn!("[TEST 5/7 - UART2 COBS LOOPBACK] SKIPPED (une GPIO16 y GPIO17 con un jumper)");
     }
 
     // TEST 6: ARQ con ACK explicito tras commit + BIB-HMAC-SHA2 RFC 9173.
@@ -281,6 +288,9 @@ pub fn run_hardware_stress_suite(
         ),
         RouteDecision::DropIntegrityFailed
     );
+    if signed_outbound.has_pending() {
+        let _ = signed_outbound.mark_last_persisted();
+    }
     let mut tampered = [0u8; 128];
     let tamper_len = signed_bundle.len().min(tampered.len());
     tampered[..tamper_len].copy_from_slice(signed_bundle);
@@ -303,9 +313,62 @@ pub fn run_hardware_stress_suite(
         RouteDecision::DropIntegrityFailed
     );
     info!(
-        "[TEST 6/6 - ARQ COMMIT + BPSec BIB] arq_stop_and_wait={} signed_accepted={} tamper_rejected={}",
+        "[TEST 6/7 - ARQ COMMIT + BPSec BIB] arq_stop_and_wait={} signed_accepted={} tamper_rejected={}",
         arq_ok, signed_ok, tamper_rejected
     );
+
+    // TEST 7: ARQ end-to-end sobre el loopback físico UART2 (GPIO17 -> GPIO16).
+    // El ACK solo se emite tras commit_rx_ack(), igual que en el firmware, y
+    // el emisor debe volver a Idle con la trama recibida bit-exacta.
+    let mut phys_tx = ReliableSerialCla::<256, 288, 256>::new(50_000, 2);
+    let mut phys_rx = ReliableSerialCla::<256, 288, 256>::new(50_000, 2);
+    let mut phys_wire = [0u8; 288];
+    let phys_tx_ok = phys_tx.send(signed_bundle, 0).is_ok();
+    let phys_frame_len = phys_tx.encoded_frame().len().min(phys_wire.len());
+    phys_wire[..phys_frame_len].copy_from_slice(&phys_tx.encoded_frame()[..phys_frame_len]);
+    let _ = uart.write(&phys_wire[..phys_frame_len]);
+
+    let mut phys_rx_byte = [0u8; 1];
+    let phys_data_start = Instant::now();
+    let mut phys_data_ok = false;
+    while phys_data_start.elapsed() < Duration::from_millis(100) {
+        if uart.read_buffered(&mut phys_rx_byte).is_ok()
+            && let Ok(Some(RxEvent::Data { .. })) = phys_rx.push_byte(phys_rx_byte[0], 1)
+        {
+            phys_data_ok = phys_rx.rx_payload() == signed_bundle;
+            break;
+        }
+    }
+    let phys_commit_ok = phys_data_ok && phys_rx.commit_rx_ack().is_ok();
+    let mut phys_ack_wire = [0u8; 8];
+    let phys_ack_len = phys_rx.encoded_frame().len().min(phys_ack_wire.len());
+    phys_ack_wire[..phys_ack_len].copy_from_slice(&phys_rx.encoded_frame()[..phys_ack_len]);
+    let _ = uart.write(&phys_ack_wire[..phys_ack_len]);
+
+    let phys_ack_start = Instant::now();
+    let mut phys_ack_ok = false;
+    while phys_ack_start.elapsed() < Duration::from_millis(100) {
+        if uart.read_buffered(&mut phys_rx_byte).is_ok()
+            && let Ok(Some(RxEvent::Ack { .. })) = phys_tx.push_byte(phys_rx_byte[0], 2)
+        {
+            phys_ack_ok = true;
+            break;
+        }
+    }
+    let physical_arq_ok = phys_tx_ok
+        && phys_data_ok
+        && phys_commit_ok
+        && phys_ack_ok
+        && phys_tx.state() == ArqState::Idle
+        && phys_rx.pending_commit().is_none();
+    if physical_arq_ok {
+        info!("[TEST 7/7 - ARQ PHYSICAL LOOPBACK] PASS: Data -> commit -> ACK -> Idle (GPIO17 -> GPIO16)");
+    } else {
+        warn!(
+            "[TEST 7/7 - ARQ PHYSICAL LOOPBACK] SKIPPED/FAIL (tx={} data={} commit={} ack={}); requiere jumper",
+            phys_tx_ok, phys_data_ok, phys_commit_ok, phys_ack_ok
+        );
+    }
 
     info!("==========================================================");
     info!("[STRESS] SUITE COMPLETADA SIN PANICS NI CORRUPCION");
