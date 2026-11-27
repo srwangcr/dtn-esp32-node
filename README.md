@@ -189,11 +189,11 @@ locales en `main()` y por tanto son **buffers temporales en stack**, no
 | Métrica | Resultado medido |
 | :--- | :--- |
 | Pipeline BPv7 + BIB-HMAC-SHA2 en SRAM | **165 – 173 us** |
-| Pipeline + BIB + persistencia hasta `PersistedToWal` (IPPT §3.7) | **679 us** |
+| Pipeline + BIB + persistencia hasta `PersistedToWal` (IPPT §3.7) | **752 us** |
 | Erase + write + read-back en NOR (10 sectores) | **avg = 36.87 ms \| max = 37.35 ms** |
 | Verificación de sector recién escrito (magic + seq + CRC32C) | **10/10 OK** |
 | Fuzzing CBOR / BPv7 / BIB (50 tramas) | **50/50 rechazadas, 0 panics** |
-| Binario release | **143,456 B** (1.71% de partición) |
+| Binario release | **139,312 B** (1.67% de partición) |
 | Pull-the-Plug / soak test (mediciones históricas) | replay desde WAL confirmado; 1 h 50 min sin panic |
 
 > Las cifras de la tabla son mediciones tomadas en silicio sobre la revisión
@@ -219,7 +219,7 @@ locales en `main()` y por tanto son **buffers temporales en stack**, no
 
 | Implementación | Lenguaje | Destino | Heap | BPv7 | BPSec BIB | CLA principales | Huella / latencia (*) |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **dtn-esp32-node (este proyecto)** | Rust `no_std` | ESP32-WROOM-32 (Xtensa) | **0 B** | Sí (bundle completo, cola transaccional) | Sí (RFC 9173 BIB-HMAC-SHA2, Scope Flags = 1) | UART2/COBS + ARQ con ACK durable, `reset_transport()` y tombstone `Delivered` de 28 B | **143,456 B** (1.71% de partición) binario, **~18.5 KB SRAM** pico, 165–173 us pipeline (ver arriba) |
+| **dtn-esp32-node (este proyecto)** | Rust `no_std` | ESP32-WROOM-32 (Xtensa) | **0 B** | Sí (bundle completo, cola transaccional) | Sí (RFC 9173 BIB-HMAC-SHA2, Scope Flags = 1) | UART2/COBS + ARQ con ACK durable, `reset_transport()` y tombstone `Delivered` de 28 B | **139,312 B** (1.67% de partición) binario, **~18.5 KB SRAM** pico, 165–173 us pipeline (ver arriba) |
 | ION-DTN | C | Linux / RTOS | Sí | Sí (completo) | Sí | UDP, TCP, LTP, BP over multiple CLA | Orden de MB de RAM; latencia dependiente de SO |
 | µD3TN | C | Linux embebido / MCU | Sí (pequeño) | Sí | Sí (BIB) | UDP, TCP, serial (dtn) | Decenas de KB a cientos de KB |
 | dtn7-rs | Rust (`std`/async) | Linux / servidor | Sí | Sí | Sí (BIB/BCS) | TCP, UDP, WebSockets | Orden de MB; latencia de red dominante |
