@@ -153,12 +153,12 @@ estático del crate se reduce a contadores/estado HAL (sin tablas grandes).
 
 | Métrica | Resultado medido |
 | :--- | :--- |
-| Pipeline BPv7 + BIB-HMAC-SHA2 en SRAM | **165 – 173 us** |
-| Pipeline + BIB + persistencia hasta `PersistedToWal` (IPPT §3.7) | **679 us** |
+| Pipeline BPv7 + BIB-HMAC-SHA2 en SRAM | **260 – 266 us** (max 570 us) |
+| Pipeline + BIB + persistencia hasta `PersistedToWal` (IPPT §3.7) | **788 us** |
 | Erase + write + read-back en NOR (10 sectores) | **avg = 36.87 ms \| max = 37.35 ms** |
 | Verificación de sector recién escrito (magic + seq + CRC32C) | **10/10 OK** |
 | Fuzzing CBOR / BPv7 / BIB (50 tramas) | **50/50 rechazadas, 0 panics** |
-| Binario release | **143,456 B** |
+| Binario release | **150,368 B** (1.81% de partición) |
 | Pull-the-Plug / soak test (mediciones históricas) | replay desde WAL confirmado; 1 h 50 min sin panic |
 
 > Las cifras de la tabla son mediciones tomadas en silicio sobre la revisión
@@ -184,7 +184,7 @@ estático del crate se reduce a contadores/estado HAL (sin tablas grandes).
 
 | Implementación | Lenguaje | Destino | Heap | BPv7 | BPSec BIB | CLA principales | Huella / latencia (*) |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **dtn-esp32-node (este proyecto)** | Rust `no_std` | ESP32-WROOM-32 (Xtensa) | **0 B** | Sí (bundle completo, cola transaccional) | Sí (RFC 9173 BIB-HMAC-SHA2, Scope Flags = 1) | UART2/COBS + ARQ con ACK durable y tombstone `Delivered` | **143,456 B** binario, **< 15 KB SRAM** pico, 165–173 us pipeline (ver arriba) |
+| **dtn-esp32-node (este proyecto)** | Rust `no_std` | ESP32-WROOM-32 (Xtensa) | **0 B** | Sí (bundle completo, cola transaccional) | Sí (RFC 9173 BIB-HMAC-SHA2, Scope Flags = 1) | UART2/COBS + ARQ con ACK durable y tombstone `Delivered` | **150,368 B** (1.81% de partición) binario, **< 15 KB SRAM** pico, 165–173 us pipeline (ver arriba) |
 | ION-DTN | C | Linux / RTOS | Sí | Sí (completo) | Sí | UDP, TCP, LTP, BP over multiple CLA | Orden de MB de RAM; latencia dependiente de SO |
 | µD3TN | C | Linux embebido / MCU | Sí (pequeño) | Sí | Sí (BIB) | UDP, TCP, serial (dtn) | Decenas de KB a cientos de KB |
 | dtn7-rs | Rust (`std`/async) | Linux / servidor | Sí | Sí | Sí (BIB/BCS) | TCP, UDP, WebSockets | Orden de MB; latencia de red dominante |
